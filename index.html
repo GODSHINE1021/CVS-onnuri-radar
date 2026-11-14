@@ -1094,9 +1094,10 @@ function liveBlock(e) {
   const on = L.key === e.p.id;
   if (!on) return `<div class="card-b" style="border-top:1px solid var(--border)"><button class="btn sm" id="live-go">${ic('refresh', 14)}실시간 카카오 조회 (반경 ${Math.round(e.r)}m)</button> <span class="faint">카카오 18개 업종 카테고리 기준 · 상가정보 CSV와 교차 확인용</span></div>`;
   const rows = L.places.filter(p => p.d <= e.r * UI.EDGE);
+  const inR = L.places.filter(p => p.d <= e.r).length;
   return `<div class="card-b" style="border-top:1px solid var(--border)">
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><b>실시간 카카오 조회</b>
-      <span class="chip o">${L.state === 'loading' ? '조회 중…' : `${rows.length}건`}</span>
+      <span class="chip o">${L.state === 'loading' ? '조회 중…' : `반경 ${Math.round(e.r)}m 내 ${inR}건 · 주변 ${rows.length}건`}</span>
       <button class="btn xs" id="live-go">다시 조회</button></div>
     ${L.state === 'error' ? `<div class="faint">카카오 조회 실패 — 키/도메인 또는 호출 한도를 확인하세요.</div>` : rows.length ? `<div class="tbl-wrap"><table class="tbl num"><thead><tr><th>상호</th><th>업종</th><th>거리</th><th>주소</th></tr></thead><tbody>
       ${rows.map(p => `<tr><td><b>${esc(p.name)}</b></td><td>${esc(p.cat)}</td><td>${Math.round(p.d)}m</td><td class="faint">${esc(p.addr || '')}</td></tr>`).join('')}</tbody></table></div>` : `<div class="faint">반경 내 카카오 등록 장소가 없습니다.</div>`}
@@ -1110,7 +1111,7 @@ async function t1Live(e) {
   if (!KMap.ready || !kakao.maps.services) { APP.live.state = 'error'; renderShops(e); return; }
   const ps = new kakao.maps.services.Places();
   const center = new kakao.maps.LatLng(e.p.lat, e.p.lng);
-  const radius = Math.max(30, Math.round(e.r));
+  const radius = Math.max(50, Math.round(e.r * 1.5));
   const seen = new Map();
   const jobs = KAKAO_GROUPS.map(([code, label]) => new Promise(res => {
     const collect = (data, status, pagination) => {
