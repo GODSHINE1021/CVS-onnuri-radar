@@ -1463,25 +1463,27 @@ function t2Map(zones) {
   const pts = fo ? [fo] : zones.length ? zones.map(r => r.z) : DB.zones;
   let center, extent;
   if (fo) { center = fo; extent = fo.radius ? Math.max(fo.radius * 2.6, 220) : 220; }
+  else if (!f && !$('#f-sido').value && !$('#f-sgg').value) { center = { lat: 37.30, lng: 127.03 }; extent = 14000; }
   else if (pts.length) {
     const lats = pts.map(p => p.lat), lngs = pts.map(p => p.lng);
     center = { lat: (Math.min(...lats) + Math.max(...lats)) / 2, lng: (Math.min(...lngs) + Math.max(...lngs)) / 2 };
     extent = Math.max(400, ...pts.map(p => dist(center, p) + (p.radius || 0))) * 1.15;
   } else { center = { lat: 36.4, lng: 127.8 }; extent = 260000; }
   const inView = p => dist(center, p) < extent * 1.6;
-  const stores = DB.stores.filter(inView).slice(0, 900);
+  const stores = DB.stores.filter(inView).slice(0, 400);
   $('#map2-caption').textContent = fo ? fo.name : `구역 ${zones.length} · GS25 ${stores.length}`;
   mapNote('map2');
   const zc = r => r.status === '지정 완료' ? '#7357C9' : '#C98A1B';
+  const visZones = zones.filter(r => inView(r.z)).slice(0, extent > 8000 ? 120 : 400);
   if (KMap.ready) {
     const id = 'map2', m = KMap.map(id); KMap.clear(id); m.relayout();
-    zones.slice(0, 400).forEach(r => KMap.zoneColored(id, r.z, zc(r), f && f.id === r.id, () => t2FocusFromMap('zone', r.id)));
+    visZones.forEach(r => KMap.zoneColored(id, r.z, zc(r), f && f.id === r.id, () => t2FocusFromMap('zone', r.id)));
     stores.forEach(s => KMap.gs(id, s, false, () => { switchView('check'); t1Select({ kind: 'store', ...s }); }));
     m.setCenter(KMap.ll(center));
     m.setLevel(extent < 300 ? 3 : extent < 800 ? 5 : extent < 3000 ? 7 : extent < 20000 ? 9 : 12);
   } else {
     svgMap($('#map2'), { center, extent, layers: [
-      ...zones.slice(0, 300).map(r => ({ t: 'zone', z: r.z, color: zc(r), strong: f && f.id === r.id, label: extent < 20000, attr: `data-zone="${esc(r.id)}"` })),
+      ...visZones.map(r => ({ t: 'zone', z: r.z, color: zc(r), strong: f && f.id === r.id, label: extent < 20000, attr: `data-zone="${esc(r.id)}"` })),
       ...stores.slice(0, 400).map(s => ({ t: 'gs', p: s, attr: `data-gs="${esc(s.id)}"` })),
     ] });
     $('#map2 svg').onclick = e => {
