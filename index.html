@@ -1423,6 +1423,7 @@ function t2Table() {
 function t2Sort(rows, cols) { if (!T2.sort.k) return rows; const c = cols.find(c => c.k === T2.sort.k); return c ? sortBy(rows, c.v, T2.sort.dir) : rows; }
 
 function t2Render() {
+  T2.rendered = true;
   const allZ = DB.zones;
   fillSelect($('#f-sido'), uniq([...allZ.map(z => z.sido), ...DB.stores.map(s => s.sido)]));
   const sido = $('#f-sido').value;
@@ -1474,11 +1475,11 @@ function t2Map(zones) {
     extent = Math.max(400, ...pts.map(p => dist(center, p) + (p.radius || 0))) * 1.15;
   } else { center = { lat: 36.4, lng: 127.8 }; extent = 260000; }
   const inView = p => dist(center, p) < extent * 1.6;
-  const stores = DB.stores.filter(inView).slice(0, 400);
+  const stores = extent > 8000 ? [] : DB.stores.filter(inView).slice(0, 400);
   $('#map2-caption').textContent = fo ? fo.name : `구역 ${zones.length} · GS25 ${stores.length}`;
   mapNote('map2');
   const zc = r => r.status === '지정 완료' ? '#7357C9' : '#C98A1B';
-  const visZones = zones.filter(r => inView(r.z)).slice(0, extent > 8000 ? 120 : 400);
+  const visZones = zones.filter(r => inView(r.z)).slice(0, extent > 8000 ? 80 : 400);
   if (KMap.ready) {
     const id = 'map2', m = KMap.map(id); KMap.clear(id); m.relayout();
     visZones.forEach(r => KMap.zoneColored(id, r.z, zc(r), f && f.id === r.id, () => t2FocusFromMap('zone', r.id)));
@@ -1617,7 +1618,7 @@ function switchView(v) {
   if (location.hash !== '#' + v) history.replaceState(null, '', '#' + v);
   requestAnimationFrame(() => {
     if (v === 'check' && T1.ev) renderMap1(T1.ev);
-    if (v === 'db') t2Map();
+    if (v === 'db') { if (!T2.rendered) t2Render(); else t2Map(); }
     if (v === 'discover' && T3.dirty) t3Render();
   });
 }
