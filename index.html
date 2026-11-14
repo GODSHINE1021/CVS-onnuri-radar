@@ -604,7 +604,7 @@ function buildDB(raw) {
     address: a[ix.address], lat: a[ix.lat], lng: a[ix.lng],
     n2000: a[ix.n2000], n5000: a[ix.n5000], n10000: a[ix.n10000],
     s2000: a[ix.s2000], s5000: a[ix.s5000], s10000: a[ix.s10000],
-    other10000: a[ix.other10000], cov: a[ix.cov] === 1, onnuri_member: false,
+    other10000: a[ix.other10000], cov: a[ix.cov] === 1, onnuri_member: false, kind: 'store',
   }));
   DB.coverage = {};
   DB.stores.forEach(s => {
