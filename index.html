@@ -1074,6 +1074,9 @@ function t1Run() {
       ${e.p.kind === 'store' && e.nOther ? `<span class="k">행정경계</span><span>반경 56m 내 타 시·군·구 상가 <b>${e.nOther}</b>곳 혼입</span>` : ''}
     </div>`;
   renderVerdict(e); renderShops(e); renderAction(e); renderMap1(e);
+  if (e.p.kind === 'store' && e.p.cov && !DB.nearby[e.p.sido]) {
+    loadNearby(e.p.sido).then(() => { if (T1.ev === e) renderShops(e); });
+  }
 }
 
 function t1Expected(e) {
@@ -1223,7 +1226,7 @@ function renderAction(e) {
         <button class="btn" id="ph-copy">${ic('copy', 14)}복사</button>
       </div>
       <div class="foot" style="padding:6px 2px 0">${r.source_url ? `<a href="${esc(r.source_url)}" target="_blank" rel="noopener">자치법규정보시스템에서 조례 원문 확인 ↗</a> · ` : ''}${r.note ? esc(r.note) : ''}</div>`
-      : stateBox('info', '담당 부서 정보 없음', `${e.p.sido} ${e.p.sigungu}가 city_rules에 등록되지 않았습니다.`)}
+      : stateBox('info', '조례·담당 부서 미등록', `${e.p.sido} ${e.p.sigungu}의 골목형상점가 조례가 아직 DB에 없습니다. 위 판정은 법정 기본 기준(2천㎡ 30개)으로 계산했습니다. 지자체 대표번호로 담당 부서를 확인해 등록하세요.`)}
       <div class="sub-h">통화 기록 <span class="faint">${logs.length}건 · 이 브라우저에 저장</span></div>
       <div class="log-form">
         <select class="select" id="log-res" aria-label="통화 결과"><option>통화 완료</option><option>부재·재연락</option><option>회신 대기</option><option>자료 요청 받음</option><option>방문 상담 예정</option></select>
