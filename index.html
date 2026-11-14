@@ -1645,7 +1645,8 @@ function rebuild() {
   updateHeader(); updateNavKPI();
   if (T1.sel && T1.sel.kind === 'store') { const s = DB.stores.find(x => x.id === T1.sel.id); T1.sel = s ? { kind: 'store', ...s } : null; }
   T1.sel ? t1Run() : t1RenderEmpty();
-  t2Render(); t3Render();
+  T3.dirty = true;
+  if ((location.hash || '').slice(1) === 'db') t2Render();
 }
 function bootError(msg) {
   $('#boot').innerHTML = stateBox('err', '데이터를 불러오지 못했습니다', msg, '<button class="btn primary" id="boot-retry">다시 시도</button>');
