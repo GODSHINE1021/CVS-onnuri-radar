@@ -425,7 +425,7 @@ svg.fmap [data-sid],svg.fmap [data-zone],svg.fmap [data-gs]{cursor:pointer}
           <div class="field"><label for="f-fresh">데이터 갱신일</label><select class="select" id="f-fresh"><option value="">전체</option><option value="fresh">최신(90일 이내)</option><option value="stale">갱신 대기</option></select></div>
           <div class="acts"><button class="btn ghost" id="f-reset">초기화</button><button class="btn" id="f-csv"><span data-i="down"></span>CSV 다운로드</button></div>
         </div>
-        <div class="kpis" style="grid-template-columns:repeat(3,1fr)" id="t2-kpis"></div>
+        <div class="kpis" style="grid-template-columns:repeat(4,1fr)" id="t2-kpis"></div>
         <div class="t2-body">
           <div class="card">
             <div class="card-h">
@@ -689,9 +689,12 @@ function evaluate(p, areaM2) {
   const inside = zc.filter(x => x.inside), overlapping = zc.filter(x => !x.inside && x.overlap), nearest = zc[0] || null;
 
   const base = rule.base_area || 2000;
-  const th = rule.min_shops;
+  const thCom = rule.min_shops || null;
+  const thNon = rule.min_shops_non_commercial || null;
+  const th = thCom || thNon;            // 보수적 기본값(상업지역 기준)
   let v = 'na', label = '기준 미등록', reasons = [];
   let per = null, ratio = null, required = null, nAll = 0, nSmall = 0, nOther = 0;
+  let reqCom = null, reqNon = null, passCom = null, passNon = null;
 
   if (!c) {
     v = 'na'; label = '상가 데이터 미수집';
@@ -702,22 +705,44 @@ function evaluate(p, areaM2) {
     per = nSmall * base / areaM2;
     required = th ? Math.ceil(th * areaM2 / base) : null;
     ratio = th ? per / th : null;
-    if (inside.length) {
+    reqCom = thCom ? Math.ceil(thCom * areaM2 / base) : null;
+    reqNon = thNon ? Math.ceil(thNon * areaM2 / base) : null;
+    passCom = thCom ? per >= thCom : null;
+    passNon = thNon ? per >= thNon : null;
+    const nearTh = thNon || th;
+    if (!th) {
+      v = 'na'; label = '조례 별표 기준 확인 필요';
+      reasons.push(`${rule.ordinance}은(는) 면적당 점포수 기준을 조례 별표에 위임하고 있어 DB에 수치가 없습니다.`);
+      reasons.push(`환산 점포수는 ${per.toFixed(1)}개입니다. 법정 기본(2,000㎡당 30개)과 비교하면 ${per >= 30 ? '충족' : '미달'}이지만, 실제 기준은 담당 부서(${rule.dept || '미확인'})에 별표 원문으로 확인해야 합니다.`);
+    } else if (inside.length) {
       v = 'cond'; label = '조건부 — 기존 구역 내';
       reasons.push(`이미 '${inside[0].z.name}'(${inside[0].z.type}) 구역 안에 있습니다. 신규 지정보다 기존 구역 온누리 가맹 등록을 우선 검토하세요.`);
-    } else if (ratio >= 1 && !overlapping.length) {
-      v = 'pass'; label = '적합';
-      reasons.push(`${fmt(base)}㎡ 환산 소상공인 점포 ${per.toFixed(1)}개로 ${local ? '조례' : '법정 기본'} 기준 ${th}개를 충족합니다.`);
-    } else if (ratio >= 1) {
+    } else if (passCom === true && !overlapping.length) {
+      v = 'pass'; label = thNon != null ? '적합 — 상업·비상업 기준 모두 충족' : '적합';
+      reasons.push(thNon != null
+        ? `${fmt(base)}㎡ 환산 소상공인 점포 ${per.toFixed(1)}개로 상업지역 기준 ${thCom}개와 비상업 기준 ${thNon}개를 모두 넘습니다. 용도지역과 무관하게 기준 충족입니다.`
+        : `${fmt(base)}㎡ 환산 소상공인 점포 ${per.toFixed(1)}개로 ${local ? '조례' : '법정 기본'} 기준 ${th}개를 충족합니다.`);
+    } else if (passCom === true) {
       v = 'cond'; label = '조건부 — 구역 경계 중첩';
       reasons.push(`기준은 충족하나 '${overlapping[0].z.name}' 구역과 검토 반경이 겹칩니다. 구역 경계 조정이 필요합니다.`);
-    } else if (ratio >= CONFIG.COND_RATIO) {
+    } else if (passNon === true) {
+      v = 'cond'; label = '조건부 — 비상업 기준 충족';
+      reasons.push(`환산 ${per.toFixed(1)}개로 비상업지역 기준(${thNon}개)은 충족하지만, 상업지역 기준(${thCom}개)에는 ${(thCom - per).toFixed(1)}개 부족합니다.`);
+      reasons.push('이 구역의 용도지역이 상업지역이면 부적합, 그 외 지역이면 적합입니다. 용도지역은 토지이음(eum.go.kr) 또는 지자체 담당 부서에서 확인하세요.');
+    } else if (per >= nearTh * CONFIG.COND_RATIO) {
       v = 'cond'; label = '조건부 — 기준 근접';
-      reasons.push(`충족률 ${(ratio*100).toFixed(0)}%. 소상공인 점포 ${Math.max(0, required - nSmall)}개 추가 확보 또는 구역 경계 조정 시 충족 가능합니다.`);
+      reasons.push(thNon != null
+        ? `비상업 기준(${thNon}개) 대비 충족률 ${(per / thNon * 100).toFixed(0)}%, 상업 기준(${thCom}개) 대비 ${(per / thCom * 100).toFixed(0)}%입니다. 소상공인 점포 ${Math.max(0, reqNon - nSmall)}개 이상 추가 확보 또는 구역 경계 조정 시 비상업 기준 충족이 가능합니다.`
+        : `충족률 ${(ratio*100).toFixed(0)}%. 소상공인 점포 ${Math.max(0, required - nSmall)}개 추가 확보 또는 구역 경계 조정 시 충족 가능합니다.`);
     } else {
       v = 'fail'; label = '부적합';
-      reasons.push(`충족률 ${(ratio*100).toFixed(0)}%로 ${local ? '조례' : '법정 기본'} 기준(${th}개/${fmt(base)}㎡)에 미달합니다.`);
+      reasons.push(thNon != null
+        ? `환산 ${per.toFixed(1)}개로 비상업 기준(${thNon}개)에도 미달합니다(충족률 ${(per / thNon * 100).toFixed(0)}%).`
+        : `충족률 ${(ratio*100).toFixed(0)}%로 ${local ? '조례' : '법정 기본'} 기준(${th}개/${fmt(base)}㎡)에 미달합니다.`);
     }
+    if (th && local && rule.excludes_road_parking === true) reasons.push(`이 조례는 면적 산정 시 도로·주차장 등 공용면적을 제외할 수 있습니다(제외 시 밀집도가 더 높게 계산됩니다). ${rule.area_note || ''}`);
+    if (th && local && rule.owner_consent_waived === true) reasons.push('지정 신청에 토지·건축물 소유자 동의는 필요하지 않고, 상인 동의만으로 신청할 수 있습니다(조례 확인).');
+    else if (th && local && rule.owner_consent_waived === false) reasons.push('지정 신청에 토지·건축물 소유자 동의(각 1/2 이상)가 필요합니다 — 상인 동의만으로는 신청할 수 없습니다.');
     reasons.push(`반경 ${r.toFixed(0)}m(${fmt(areaM2)}㎡) 내 상가업소 ${nAll}개 중 소상공인 점포 ${nSmall}개로 산정했습니다. 대형마트·백화점 등 대규모 점포는 제외했습니다.`);
     reasons.push('상가(상권)정보는 호실(층·호) 단위로 등록되어, 한 건물에 여러 점포가 있는 상가·오피스 건물에서는 밀집도가 높게 집계될 수 있습니다. 실제 점포 수는 현장 확인이 필요합니다.');
     if (p.other10000) reasons.push(`반경 56m 내 상가 ${p.other10000}곳이 다른 시·군·구 소재입니다(행정경계 인접). 구역 설정 시 관할 지자체 확인이 필요합니다.`);
@@ -733,7 +758,7 @@ function evaluate(p, areaM2) {
     score += 10;
   }
   return {
-    p, rule: local, natRule: !local, area: areaM2, r, base, th, required, per, ratio,
+    p, rule: local, natRule: !local, area: areaM2, r, base, th, thCom, thNon, reqCom, reqNon, passCom, passNon, required, per, ratio,
     nAll, nSmall, nOther, counts: c, zc, inside, overlapping, nearest, v, label, reasons,
     score: Math.round(score),
   };
@@ -1145,6 +1170,30 @@ function noteBox(e) {
 }
 
 
+/* 조례 기준 표기 — 상업/비상업 이중 기준과 별표 위임 처리 */
+function ruleStdHTML(e) {
+  const base = fmt(e.base);
+  if (e.rule && !e.th) return `<b class="num">${base}㎡</b> 기준 점포수는 <b>조례 별표</b>에 위임 — 별표 원문 확인 필요 <span class="faint">(법정 기본 30개와 임시 비교)</span>`;
+  if (e.thNon != null) {
+    return `<b class="num">${base}㎡</b>당 상업지역 <b>${e.thCom}개</b> · 비상업 <b>${e.thNon}개</b> 이상`
+      + `<div class="faint" style="margin-top:4px">환산 ${e.per != null ? e.per.toFixed(1) : '—'}개 → `
+      + `<b style="color:${e.passCom ? 'var(--success)' : 'var(--danger)'}">상업 ${e.passCom ? '충족' : '미달'}</b> · `
+      + `<b style="color:${e.passNon ? 'var(--success)' : 'var(--danger)'}">비상업 ${e.passNon ? '충족' : '미달'}</b>`
+      + ` <span class="faint">(용도지역 미확인 → 두 기준 동시 비교)</span></div>`;
+  }
+  return `<b class="num">${base}㎡</b>당 소상공인 <b>${e.th}개</b> 이상 <span class="faint">(조례상 단일 기준)</span>`;
+}
+
+/* 조례 완화 조건 배지 */
+function ruleBadges(r) {
+  if (!r) return '<span class="chip w">조례 미확인</span>';
+  const a = r.excludes_road_parking === true ? '<span class="chip s">도로·주차장 면적 제외 가능</span>'
+    : r.excludes_road_parking === false ? '<span class="chip o">도로 면적 포함</span>' : '<span class="chip o">면적 제외 규정 없음</span>';
+  const b = r.owner_consent_waived === true ? '<span class="chip s">소유자 동의 불요 · 상인 동의만</span>'
+    : r.owner_consent_waived === false ? '<span class="chip w">토지·건축물 소유자 동의 필요</span>' : '<span class="chip o">동의 요건 조례 미기재</span>';
+  return a + ' ' + b;
+}
+
 function renderVerdict(e) {
   const r = e.rule, m = VMETA[e.v];
   const pct = e.ratio != null ? Math.round(e.ratio * 100) : null;
@@ -1158,15 +1207,16 @@ function renderVerdict(e) {
       <div class="right"><button class="btn sm" id="v-copy">${ic('copy', 14)}요약 복사</button></div></div>
     <div class="vhead">${badge(e.v, true)}<div><div class="h" style="color:${m.color}">${m.head}</div><div class="s">${esc(e.p.name)} · ${esc(e.label)}</div></div></div>
     <div class="vrows">
-      <div class="vrow"><span class="k">적용 기준</span><span class="v"><b>${ruleName}</b> ${r && r.updated ? `<span class="faint">(기준일 ${esc(r.updated)})</span>` : ''}</span></div>
-      <div class="vrow"><span class="k">점포 밀집 기준</span><span class="v">${fmt(e.base)}㎡당 소상공인 <b>${e.th}개</b> 이상</span></div>
+      <div class="vrow"><span class="k">적용 기준</span><span class="v"><b>${ruleName}</b> ${r && r.updated ? `<span class="faint">(기준일 ${esc(r.updated)})</span>` : ''} ${r && r.source_url ? `<a class="faint" href="${esc(r.source_url)}" target="_blank" rel="noopener" style="margin-left:6px;text-decoration:underline">조례 원문</a>` : ''}${r && r.dept ? `<span class="faint" style="margin-left:6px">담당 ${esc(r.dept)}${r.phone ? ' ' + esc(r.phone) : ''}</span>` : ''}</span></div>
+      <div class="vrow"><span class="k">점포 밀집 기준</span><span class="v">${ruleStdHTML(e)}</span></div>
+      <div class="vrow"><span class="k">조례 완화 조건</span><span class="v">${ruleBadges(e.rule)}</span></div>
       <div class="vrow"><span class="k">검토 구역</span><span class="v"><b class="num">${fmt(e.area)}㎡</b> <span class="faint">(원형 환산 반경 ${Math.round(e.r)}m${e.counts && e.counts.est ? ' · 보간 추정' : ' · 실측'})</span></span></div>
       <div class="vrow"><span class="k">충족률</span><span class="v" style="display:flex;align-items:center;gap:12px"><span class="prog" style="flex:1"><i style="width:${w}%;background:${m.color}"></i><span class="tick" style="left:${100 / 1.5}%" title="기준 100%"></span></span><b class="num" style="min-width:44px;text-align:right;color:${m.color}">${pct != null ? pct + '%' : '—'}</b></span></div>
       <div class="vrow"><span class="k">기존 구역 거리</span><span class="v">${e.nearest ? `<b>${esc(e.nearest.z.name)}</b> 중심 ${fmtD(e.nearest.d)} · 경계 ${fmtD(e.nearest.edge)} <span class="chip ${rel[1]}">${rel[0]}</span>` : '—'}</span></div>
       <div class="vrow" style="border-bottom:0"><span class="k">중복 여부</span><span class="v">${dup}</span></div>
     </div>
     <div class="trio num">
-      <div><div class="k">필요 상가 수</div><div class="v">${e.required ?? '—'}<small>${e.required != null ? '개' : ''}</small></div></div>
+      <div><div class="k">필요 상가 수</div><div class="v">${e.required ?? '—'}<small>${e.required != null ? '개' : ''}${e.thNon != null ? ` <span class="faint" style="font-size:11px">(비상업 ${e.reqNon})</span>` : ''}</small></div></div>
       <div><div class="k">반경 내 소상공인</div><div class="v" style="color:${e.required != null ? (e.nSmall >= e.required ? 'var(--success)' : 'var(--danger)') : 'inherit'}">${e.counts ? e.nSmall : '—'}<small>${e.counts ? `개 / 상가 ${e.nAll}` : '미수집'}</small></div></div>
       <div><div class="k">예상 상가 수(경계 +15%)</div><div class="v">${expected ?? '—'}<small>${expected != null ? '개' : ''}</small></div></div>
     </div>
@@ -1178,7 +1228,7 @@ function renderVerdict(e) {
 
 function t1CopySummary() {
   const e = T1.ev, r = e.rule;
-  copyText(`[온누리 적격 판별] ${e.p.name}\n주소: ${e.p.address}\n판정: ${VMETA[e.v].label} (${e.label})\n기준: ${r ? r.ordinance : NAT_RULE.ordinance + ' (미확인·법정 기본)'} — ${fmt(e.base)}㎡당 ${e.th}개\n검토면적 ${fmt(e.area)}㎡ / 필요 ${e.required ?? '-'} · 반경 내 소상공인 ${e.counts ? e.nSmall : '미수집'} · ${fmt(e.base)}㎡ 환산 ${e.per != null ? e.per.toFixed(1) : '-'}개\n최근접 구역: ${e.nearest ? `${e.nearest.z.name} ${fmtD(e.nearest.d)}` : '-'}\n담당: ${r && r.phone ? `${r.sigungu} ${r.dept} ${r.team} ${r.phone}` : '-'}`, '판정 요약을 복사했습니다');
+  copyText(`[온누리 적격 판별] ${e.p.name}\n주소: ${e.p.address}\n판정: ${VMETA[e.v].label} (${e.label})\n기준: ${r ? r.ordinance : NAT_RULE.ordinance + ' (미확인·법정 기본)'} — ${e.thNon != null ? `${fmt(e.base)}㎡당 상업 ${e.thCom}개·비상업 ${e.thNon}개` : `${fmt(e.base)}㎡당 ${e.th}개`}\n완화 조건: ${r ? `${r.excludes_road_parking === true ? '도로·주차장 면적 제외 가능' : r.excludes_road_parking === false ? '도로 면적 포함' : '면적 제외 규정 없음'} / ${r.owner_consent_waived === true ? '소유자 동의 불요(상인 동의만)' : r.owner_consent_waived === false ? '소유자 동의 필요' : '동의 요건 미기재'}` : '-'}\n검토면적 ${fmt(e.area)}㎡ / 필요 ${e.required ?? '-'} · 반경 내 소상공인 ${e.counts ? e.nSmall : '미수집'} · ${fmt(e.base)}㎡ 환산 ${e.per != null ? e.per.toFixed(1) : '-'}개\n최근접 구역: ${e.nearest ? `${e.nearest.z.name} ${fmtD(e.nearest.d)}` : '-'}\n담당: ${r && r.phone ? `${r.sigungu} ${r.dept} ${r.team} ${r.phone}` : '-'}`, '판정 요약을 복사했습니다');
 }
 
 
@@ -1353,7 +1403,8 @@ function t2Build() {
     const c = countsFor(s, CONFIG.DEFAULT_AREA);
     if (!c) return;
     const rule = findRule(s.sido, s.sigungu) || NAT_RULE;
-    if (c.small * rule.base_area / CONFIG.DEFAULT_AREA < rule.min_shops * CONFIG.COND_RATIO) return;
+    const th0 = rule.min_shops || rule.min_shops_non_commercial || NAT_RULE.min_shops;
+    if (c.small * rule.base_area / CONFIG.DEFAULT_AREA < th0 * CONFIG.COND_RATIO) return;
     const e = ev(s, CONFIG.DEFAULT_AREA);
     if (!['pass', 'cond'].includes(e.v) || e.inside.length) return;
     const z = { id: 'C-' + s.id, name: s.name.replace('GS25', '').trim() + ' 후보 구역', type: '검토 후보', sido: s.sido, sigungu: s.sigungu, lat: s.lat, lng: s.lng, radius: e.r, polygon: ngon(s, e.r), designated: '', candidate: true, store: s, ev: e };
@@ -1439,6 +1490,7 @@ function t2Render() {
     ['z', 'layers', desig.length, '개', '골목형상점가(지정)', `검토 후보 ${zones.length - desig.length}개 별도`],
     ['s', 'store', isM ? mer.length : ((DB.meta && DB.meta.merchants) || 0), '개', isM ? '가맹점(표시)' : '온누리 가맹점(전국)', isM ? `${$('#f-sido').value || '시도 선택 전'}` : `구역 매칭 ${fmt(DB.zones.reduce((a, z) => a + (z._members || 0), 0))}개`],
     ['w', 'refresh', stale, '개', '갱신 대기 수', `최종 검증 ${UI.STALE_DAYS}일 초과`],
+    ['a', 'doc', DB.rules.length, '곳', '조례 DB 등록 지자체', `전국 기초지자체 · 완화조건 ${DB.rules.filter(x => x.excludes_road_parking === true).length}곳 면적제외 · ${DB.rules.filter(x => x.owner_consent_waived === true).length}곳 소유자동의 면제`],
   ].map(([c, i, v, u, l, s]) => `<div class="kpi"><span class="ic ${c}">${ic(i, 20)}</span><div><b>${fmt(v)}<small>${u}</small></b><span>${l}</span> <span class="faint" style="font-weight:500">· ${s}</span></div></div>`).join('');
 
   const { cols, rows } = t2Table();
@@ -1513,7 +1565,8 @@ function t2Detail(id) {
       <span class="k">온누리 가맹점</span><span>${fmt(r.members || 0)}개 (상권명 매칭)</span>
       <span class="k">반경</span><span>${Math.round(z.radius)}m ${z.radius_est ? '(주소 중심점 기준 추정 — 실제 경계 미확인)' : ''}</span>
       <span class="k">기준일</span><span>${esc(z.asof || '—')}</span>
-      <span class="k">관할 기준</span><span>${rule ? `${esc(rule.ordinance)} · ${fmt(rule.base_area)}㎡당 ${rule.min_shops}개` : esc(NAT_RULE.ordinance) + ' (조례 미확인)'}</span>
+      <span class="k">관할 기준</span><span>${rule ? `${esc(rule.ordinance)} · ${rule.min_shops_non_commercial != null ? `${fmt(rule.base_area)}㎡당 상업 ${rule.min_shops}개·비상업 ${rule.min_shops_non_commercial}개` : rule.min_shops ? `${fmt(rule.base_area)}㎡당 ${rule.min_shops}개` : '기준 점포수 별표 위임'}` : esc(NAT_RULE.ordinance) + ' (조례 미확인)'}</span>
+      <span class="k">완화 조건</span><span>${rule ? (rule.excludes_road_parking === true ? '도로·주차장 면적 제외 가능' : rule.excludes_road_parking === false ? '도로 면적 포함' : '면적 제외 규정 없음') + ' · ' + (rule.owner_consent_waived === true ? '소유자 동의 불요' : rule.owner_consent_waived === false ? '소유자 동의 필요' : '동의 요건 미기재') : '—'}</span>
       <span class="k">관할 담당</span><span>${rule && rule.phone ? `${esc(rule.dept)} ${esc(rule.team)} · <b>${esc(rule.phone)}</b>` : '미등록 — 지자체 확인 필요'}</span>
       <span class="k">반경 500m GS25</span><span>${nearStores.length}개</span>
     </div>
@@ -1629,8 +1682,9 @@ function updateNavKPI() {
     if (!c) { rev++; return; }
     const rule = findRule(s.sido, s.sigungu) || NAT_RULE;
     const per = c.small * rule.base_area / CONFIG.DEFAULT_AREA;
-    if (per >= rule.min_shops) cand++;
-    else if (per >= rule.min_shops * CONFIG.COND_RATIO) rev++;
+    const th = rule.min_shops || rule.min_shops_non_commercial || NAT_RULE.min_shops;
+    if (per >= th) cand++;
+    else if (per >= th * CONFIG.COND_RATIO) rev++;
   });
   $('#k-total').textContent = fmt(DB.stores.length);
   $('#k-cand').textContent = fmt(cand);
