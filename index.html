@@ -717,6 +717,7 @@ function evaluate(p, areaM2) {
       reasons.push(`충족률 ${(ratio*100).toFixed(0)}%로 ${local ? '조례' : '법정 기본'} 기준(${th}개/${fmt(base)}㎡)에 미달합니다.`);
     }
     reasons.push(`반경 ${r.toFixed(0)}m(${fmt(areaM2)}㎡) 내 상가업소 ${nAll}개 중 소상공인 점포 ${nSmall}개로 산정했습니다. 대형마트·백화점 등 대규모 점포는 제외했습니다.`);
+    reasons.push('상가(상권)정보는 호실(층·호) 단위로 등록되어, 한 건물에 여러 점포가 있는 상가·오피스 건물에서는 밀집도가 높게 집계될 수 있습니다. 실제 점포 수는 현장 확인이 필요합니다.');
     if (p.other10000) reasons.push(`반경 56m 내 상가 ${p.other10000}곳이 다른 시·군·구 소재입니다(행정경계 인접). 구역 설정 시 관할 지자체 확인이 필요합니다.`);
     if (c.est) reasons.push('선택한 면적은 실측 프리셋(2,000·5,000·10,000㎡) 사이 보간값입니다. 프리셋 선택 시 정확한 실측값으로 판정합니다.');
     if (!local) reasons.push('이 지자체의 골목형상점가 조례 기준은 아직 DB에 없습니다. 법정 기본값으로 판정했으니 담당 부서에 실제 기준을 확인하세요.');
@@ -1432,7 +1433,7 @@ function t2Render() {
   const stale = desig.filter(r => r.stale).length;
   $('#t2-kpis').innerHTML = [
     ['z', 'layers', desig.length, '개', '골목형상점가(지정)', `검토 후보 ${zones.length - desig.length}개 별도`],
-    ['s', 'store', isM ? mer.length : DB.zones.reduce((a, z) => a + (z._members || 0), 0), '개', isM ? '가맹점(표시)' : '온누리 가맹점(전체)', isM ? `${$('#f-sido').value || '시도 선택 전'}` : '구역 매칭 합계'],
+    ['s', 'store', isM ? mer.length : ((DB.meta && DB.meta.merchants) || 0), '개', isM ? '가맹점(표시)' : '온누리 가맹점(전국)', isM ? `${$('#f-sido').value || '시도 선택 전'}` : `구역 매칭 ${fmt(DB.zones.reduce((a, z) => a + (z._members || 0), 0))}개`],
     ['w', 'refresh', stale, '개', '갱신 대기 수', `최종 검증 ${UI.STALE_DAYS}일 초과`],
   ].map(([c, i, v, u, l, s]) => `<div class="kpi"><span class="ic ${c}">${ic(i, 20)}</span><div><b>${fmt(v)}<small>${u}</small></b><span>${l}</span> <span class="faint" style="font-weight:500">· ${s}</span></div></div>`).join('');
 
