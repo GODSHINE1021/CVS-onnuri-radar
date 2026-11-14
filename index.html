@@ -537,6 +537,7 @@ const CONFIG = {
     city_rules: './data/city_rules.json',
     zones:      './data/zones.json',
     stores:     './data/stores.json',
+    store_notes: './data/store_notes.json',
   },
   AREA_PRESETS: [2000, 5000, 10000],   // 검토 구역 면적 프리셋(㎡)
   DEFAULT_AREA: 5000,
@@ -577,17 +578,19 @@ async function fetchJSON(u) {
 }
 
 async function loadRaw() {
-  const [meta, rules, zones, stores] = await Promise.all([
+  const [meta, rules, zones, stores, notes] = await Promise.all([
     fetchJSON(CONFIG.DATA_URLS.meta),
     fetchJSON(CONFIG.DATA_URLS.city_rules),
     fetchJSON(CONFIG.DATA_URLS.zones),
     fetchJSON(CONFIG.DATA_URLS.stores),
+    fetchJSON(CONFIG.DATA_URLS.store_notes).catch(() => ({})),
   ]);
-  return { meta, city_rules: rules, onnuri_zones: zones, stores };
+  return { meta, city_rules: rules, onnuri_zones: zones, stores, store_notes: notes };
 }
 
 function buildDB(raw) {
   DB.meta = raw.meta || {};
+  DB.notes = raw.store_notes || {};
   DB.rules = (raw.city_rules || []).slice();
   DB.zones = (raw.onnuri_zones || []).filter(z => z.lat && z.lng).map(z => ({
     ...z, radius: z.radius || 150, type: z.type || '골목형상점가',
@@ -1128,6 +1131,16 @@ async function t1Live(e) {
 }
 
 
+function noteBox(e) {
+  const n = (DB.notes || {})[e.p.id];
+  if (!n) return '';
+  return `<div style="margin:10px 16px 0;padding:10px 12px;border:1px solid var(--accent-100);background:var(--accent-50);border-radius:8px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><span class="chip a">${esc(n.tag || '현장 이력')}</span><b style="font-size:12.5px">${esc(n.title || '')}</b></div>
+    <div style="font-size:12px;color:var(--text-secondary);line-height:1.55">${esc(n.body || '')}</div>
+    <div class="faint" style="font-size:11px;margin-top:4px">출처 ${esc(n.source || '')} · ${esc(n.asof || '')}</div></div>`;
+}
+
+
 function renderVerdict(e) {
   const r = e.rule, m = VMETA[e.v];
   const pct = e.ratio != null ? Math.round(e.ratio * 100) : null;
@@ -1153,6 +1166,7 @@ function renderVerdict(e) {
       <div><div class="k">반경 내 소상공인</div><div class="v" style="color:${e.required != null ? (e.nSmall >= e.required ? 'var(--success)' : 'var(--danger)') : 'inherit'}">${e.counts ? e.nSmall : '—'}<small>${e.counts ? `개 / 상가 ${e.nAll}` : '미수집'}</small></div></div>
       <div><div class="k">예상 상가 수(경계 +15%)</div><div class="v">${expected ?? '—'}<small>${expected != null ? '개' : ''}</small></div></div>
     </div>
+    ${noteBox(e)}
     <button class="detail-btn" id="v-detail" aria-expanded="${T1.open}">${ic('info', 14)} 판정 근거 상세보기 ${ic('chev', 14).replace('<svg', `<svg style="transform:rotate(${T1.open ? 90 : 0}deg)`)}</button>
     ${T1.open ? `<div class="reasons"><ul>${e.reasons.map(x => `<li>${esc(x)}</li>`).join('')}</ul>
       <div class="formula">산정식: ${fmt(e.base)}㎡ 환산 = 반경 내 소상공인 ${e.nSmall}개 × ${fmt(e.base)} ÷ ${fmt(e.area)}㎡ = <b>${e.per != null ? e.per.toFixed(1) : '—'}개</b>${e.th ? ` → 기준 ${e.th}개 대비 ${pct}% (조건부 하한 ${Math.round(CONFIG.COND_RATIO * 100)}%)` : ''}. 출처: 소상공인시장진흥공단 상가(상권)정보 ${esc(DB.meta.sources ? (DB.meta.sources[1] || {}).asof || '' : '')}</div></div>` : ''}`;
