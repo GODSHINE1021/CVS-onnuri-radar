@@ -540,7 +540,7 @@ const CONFIG = {
     store_notes: './data/store_notes.json',
   },
   AREA_PRESETS: [2000, 5000, 10000],   // 검토 구역 면적 프리셋(㎡)
-  DEFAULT_AREA: 5000,
+  DEFAULT_AREA: 2000,
   COND_RATIO: 0.8,                     // 기준 대비 80% 이상이면 '조건부'
   MEMBER_NEAR_M: 300,                  // 이 거리 안에 기존 구역이 있으면 '가맹 인접성' 가점
   BOUNDARY_EDGE: 1.15,
@@ -1235,9 +1235,9 @@ function renderAction(e) {
     <div class="card-b">
       ${r ? `<div class="phone">
         <span style="color:var(--accent)">${ic('phone', 20)}</span>
-        <div class="who"><b>${esc(r.sido)} ${esc(r.sigungu)} · ${esc(r.dept)} ${esc(r.team)}${r.manager ? ' · ' + esc(r.manager) : ''}</b><span>${esc(r.phone)}</span></div>
-        <a class="btn primary" href="tel:${esc(String(r.phone).replace(/[^0-9]/g, ''))}">${ic('phone', 14)}전화 연결</a>
-        <button class="btn" id="ph-copy">${ic('copy', 14)}복사</button>
+        <div class="who"><b>${esc(r.sido)} ${esc(r.sigungu)} · ${esc(r.dept)} ${esc(r.team)}${r.manager ? ' · ' + esc(r.manager) : ''}</b><span>${r.phone ? esc(r.phone) : '연락처 미등록 — 지자체 대표번호로 확인'}</span></div>
+        ${r.phone ? `<a class="btn primary" href="tel:${esc(String(r.phone).replace(/[^0-9]/g, ''))}">${ic('phone', 14)}전화 연결</a>` : ''}
+        ${r.phone ? '<button class="btn" id="ph-copy">복사</button>' : ''}
       </div>
       <div class="foot" style="padding:6px 2px 0">${r.source_url ? `<a href="${esc(r.source_url)}" target="_blank" rel="noopener">자치법규정보시스템에서 조례 원문 확인 ↗</a> · ` : ''}${r.note ? esc(r.note) : ''}</div>`
       : stateBox('info', '조례·담당 부서 미등록', `${e.p.sido} ${e.p.sigungu}의 골목형상점가 조례가 아직 DB에 없습니다. 위 판정은 법정 기본 기준(2천㎡ 30개)으로 계산했습니다. 지자체 대표번호로 담당 부서를 확인해 등록하세요.`)}
