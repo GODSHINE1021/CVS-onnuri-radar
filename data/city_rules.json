@@ -2568,7 +2568,7 @@
   "min_shops": null,
   "min_shops_non_commercial": null,
   "excludes_road_parking": null,
-  "area_note": "",
+  "area_note": "조례 본문에 골목형상점가 지정기준 조항이 없습니다. 서울시 조례·구 담당 부서(지역경제과)로 실제 기준을 확인해야 합니다.",
   "owner_consent_waived": null,
   "consent_note": "",
   "dept": "지역경제과",
@@ -2576,7 +2576,7 @@
   "phone": "022-286-5472",
   "source_url": "https://www.law.go.kr/LSW/ordinInfoP.do?ordinSeq=2101121",
   "jachiro_url": "https://jachiro.kr/ordin/ordinance/2101121",
-  "note": "",
+  "note": "지정기준 조항 없음 — 담당 부서 확인 필요",
   "verified": true
  },
  {
