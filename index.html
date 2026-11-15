@@ -580,6 +580,17 @@ async function fetchJSON(u) {
   if (!r.ok) throw new Error(`${u} → HTTP ${r.status}`);
   return r.json();
 }
+/* 큰 파일(상가 리스트)용 — 응답이 없으면 제한 시간 뒤 실패로 돌려 '불러오는 중'에 멈추지 않게 한다 */
+async function fetchJSONTimeout(u, ms) {
+  if (typeof AbortController === 'undefined') return fetchJSON(u);
+  const c = new AbortController();
+  const t = setTimeout(() => c.abort(), ms);
+  try {
+    const r = await fetch(u, { cache: 'no-cache', signal: c.signal });
+    if (!r.ok) throw new Error(`${u} → HTTP ${r.status}`);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
 
 async function loadRaw() {
   const [meta, rules, zones, stores, notes] = await Promise.all([
@@ -626,7 +637,7 @@ async function loadNearby(sido) {
   if (DB.nearby[sido]) return DB.nearby[sido];
   if (!DB.nearbyLoading[sido]) {
     DB.nearbyState[sido] = 'loading';
-    DB.nearbyLoading[sido] = fetchJSON(`./data/nearby/${encodeURIComponent(sido)}.json`)
+    DB.nearbyLoading[sido] = fetchJSONTimeout(`./data/nearby/${encodeURIComponent(sido)}.json`, 30000)
       .then(d => { DB.nearby[sido] = d && typeof d === 'object' ? d : {}; DB.nearbyState[sido] = 'ready'; return DB.nearby[sido]; })
       .catch(() => { DB.nearbyState[sido] = 'error'; delete DB.nearbyLoading[sido]; return undefined; });
   }
@@ -1453,7 +1464,7 @@ function renderShops(e) {
         <td>${Math.round(r.d)}m</td>
         <td>${r.inc === '포함' ? '<span class="chip a">포함</span>' : '<span class="chip o">경계</span>'}</td></tr>`).join('')}
       </tbody></table>` : emptyHtml}</div>
-    <div class="pager">${pagerHTML(T1.page, pages, rows.length, size)}</div>
+    ${loading ? '' : `<div class="pager">${pagerHTML(T1.page, pages, rows.length, size)}</div>`}
     ${covNote}
     <div class="foot" style="padding:8px 16px 12px">출처: 소상공인시장진흥공단 상가(상권)정보(2026-09-30) · 반경 ${Math.round(e.r * UI.EDGE)}m 내 상가업소. 개별 점포의 온누리 가맹 여부는 탭 2에서 확인하세요.</div>
     ${liveBlock(e)}`;
@@ -1924,6 +1935,7 @@ async function start() {
     $('#boot').remove();
     /* 온누리 가맹 색인을 먼저 반영해야 탭 3의 '미가맹' 필터와 탭 1의 가맹 표시가 맞게 나온다 */
     await loadMemberIndex();
+    updateHeader(); T3.dirty = true;
     const first = DB.stores[0]; if (first && !T1.sel) t1Select({ kind: 'store', ...first });
     switchView(location.hash.slice(1) || 'check');
   } catch (err) { bootError(err.message || String(err)); }
