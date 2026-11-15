@@ -544,6 +544,8 @@ const CONFIG = {
   COND_RATIO: 0.8,                     // 기준 대비 80% 이상이면 '조건부'
   MEMBER_NEAR_M: 300,                  // 이 거리 안에 기존 구역이 있으면 '가맹 인접성' 가점
   BOUNDARY_EDGE: 1.15,
+  LABEL_MAX_LEVEL: 7,                  // 카카오맵 줌 레벨이 이보다 크면(광역) 구역 이름표를 그리지 않음
+  LABEL_MAX_EXTENT: 4000,              // SVG 지도에서 이 범위(m)보다 넓게 보면 이름표 숨김
 };
 
 /* 조례가 확인되지 않은 지자체에 적용하는 법정 기본 기준 */
@@ -569,7 +571,7 @@ const KAKAO_GROUPS = [['FD6','음식점'],['CE7','카페'],['CS2','편의점'],[
 
 const DB = {
   rules: [], zones: [], stores: [], meta: null, zoneById: {},
-  nearby: {}, nearbyLoading: {}, merchants: {}, merchantLoading: {},
+  nearby: {}, nearbyLoading: {}, nearbyState: {}, merchants: {}, merchantLoading: {},
   loadedAt: null, sample: false, coverage: {},
 };
 
@@ -617,16 +619,21 @@ function buildDB(raw) {
   DB.loadedAt = new Date();
 }
 
-/* 선택 점포 주변 상가 리스트(시도 단위 파일, 최초 1회 로드) */
+/* 선택 점포 주변 상가 리스트(시도 단위 파일, 최초 1회 로드)
+   — 파일이 큰 시도(경기 100만 건 규모)는 받는 데 수 초가 걸린다. 로딩/실패 상태를 남겨
+     "아직 안 받았음"을 "상가가 없음"으로 오해하지 않게 한다. */
 async function loadNearby(sido) {
   if (DB.nearby[sido]) return DB.nearby[sido];
   if (!DB.nearbyLoading[sido]) {
+    DB.nearbyState[sido] = 'loading';
     DB.nearbyLoading[sido] = fetchJSON(`./data/nearby/${encodeURIComponent(sido)}.json`)
-      .then(d => (DB.nearby[sido] = d)).catch(() => (DB.nearby[sido] = {}));
+      .then(d => { DB.nearby[sido] = d && typeof d === 'object' ? d : {}; DB.nearbyState[sido] = 'ready'; return DB.nearby[sido]; })
+      .catch(() => { DB.nearbyState[sido] = 'error'; delete DB.nearbyLoading[sido]; return undefined; });
   }
-  await DB.nearbyLoading[sido];
-  return DB.nearby[sido];
+  return await DB.nearbyLoading[sido];
 }
+function nearbyState(sido) { return DB.nearby[sido] ? 'ready' : (DB.nearbyState[sido] || 'idle'); }
+function nearbyReset(sido) { delete DB.nearby[sido]; delete DB.nearbyLoading[sido]; delete DB.nearbyState[sido]; }
 function nearbyList(code) { const s = DB.stores.find(x => x.id === code); if (!s || !s.cov) return []; const d = DB.nearby[s.sido]; return (d && d[code]) || []; }
 
 /* 온누리 가맹점 리스트(시도 단위 파일) */
@@ -638,6 +645,111 @@ async function loadMerchants(sido) {
   }
   await DB.merchantLoading[sido];
   return DB.merchants[sido];
+}
+
+/* ---- 4b. 온누리 가맹 매칭 — 점포 DB(GS25...) ↔ 가맹점 DB(지에스25 ...) ----
+   가맹점 DB는 상호를 "지에스25 대전노은역점", "지에스25(GS25)장대센트럴점", "GS25 광주수완점"처럼
+   제각각으로 적는다. 문자열을 그대로 비교하면 이미 가맹 등록된 점포가 '미가맹'으로 남는다.
+   아래 정규화(한글/영문 브랜드 통일 + 괄호 병기·공백·기호 제거)를 거쳐 full 이름 → 지점명 순으로 대조한다. */
+function normBizName(s, keepBrackets) {
+  let t = String(s ?? '');
+  if (t.normalize) t = t.normalize('NFKC');
+  t = t.toUpperCase();
+  t = t.replace(/\(주\)|주식회사|㈜/g, '');
+  /* 괄호 병기 처리가 두 가지로 갈린다.
+     - "지에스25(GS25)장대센트럴점" → 괄호를 통째로 지우는 쪽이 맞다(지에스25장대센트럴점).
+     - "지에스25(GS25내동롯데점)" → 괄호 안에 지점명이 들어 있어 지우면 정보가 사라진다.
+     그래서 두 변형을 모두 만들어 둘 중 하나라도 맞으면 같은 가맹점으로 본다. */
+  t = keepBrackets ? t.replace(/[()\[\]{}]/g, '') : t.replace(/\([^)]*\)|\[[^\]]*\]/g, '');
+  t = t.replace(/[^0-9A-Z가-힣]/g, '');           // 공백·가운뎃점·하이픈·쉼표 제거
+  t = t.replace(/지에스/g, 'GS');                 // 지에스25 → GS25,  지에스(GS)25 → GSGS25
+  t = t.replace(/GSGS25|GS25GS25/g, 'GS25');
+  return t;
+}
+const nameVariants = s => [normBizName(s, false), normBizName(s, true)].filter((v, i, a) => v && a.indexOf(v) === i);
+const branchKey = n => n.replace(/^GS25/, '').replace(/GS25$/, '').replace(/점$/, '');
+const isGs25 = n => n.includes('GS25');
+
+/* rows: [[상호, 상권명, 업종, 지류가맹 Y/N, 디지털가맹 Y/N, 등록연도, 시도], ...] */
+function buildMemberIndex(rows) {
+  const byFull = new Map(), byBranch = new Map();
+  (rows || []).forEach(m => {
+    const name = m[0];
+    const rec = { name, zone: m[1] || '', cat: m[2] || '', paper: m[3] === 'Y', digital: m[4] === 'Y', year: m[5] || '', sido: m[6] || '' };
+    nameVariants(name).forEach(n => {
+      if (!isGs25(n)) return;                     // GS25 계열만 대상(GS더프레쉬 등 제외)
+      if (!byFull.has(n)) byFull.set(n, rec);
+      const b = branchKey(n);
+      if (b) { const k = rec.sido + '|' + b; if (!byBranch.has(k)) byBranch.set(k, rec); }
+    });
+  });
+  return { byFull, byBranch };
+}
+function matchStoreMember(s, idx) {
+  if (!idx) return null;
+  const vs = nameVariants(s.name);
+  for (const n of vs) {
+    if (!isGs25(n)) continue;
+    const rec = idx.byFull.get(n) || idx.byBranch.get((s.sido || '') + '|' + branchKey(n));
+    if (rec) return rec;
+  }
+  return null;
+}
+function matchShopMember(name, sido) {
+  if (!DB.memberIdx) return null;
+  for (const n of nameVariants(name)) {
+    if (!isGs25(n)) continue;
+    const rec = DB.memberIdx.byFull.get(n) || DB.memberIdx.byBranch.get((sido || '') + '|' + branchKey(n));
+    if (rec) return rec;
+  }
+  return null;
+}
+/* 점포 배열에 가맹 여부를 반영하고 매칭 건수를 돌려준다 */
+function applyMemberMatch(stores, idx) {
+  if (!idx) return 0;
+  let hit = 0;
+  (stores || []).forEach(s => {
+    const rec = matchStoreMember(s, idx);
+    if (rec) { s.onnuri_member = true; s.member = rec; hit++; }
+  });
+  return hit;
+}
+DB.memberIdx = null; DB.memberLoaded = false; DB.memberLoading = null; DB.memberMatched = 0;
+/* 가벼운 색인 파일(scripts/build_member_index.py로 생성). 없으면 시도별 원본으로 보정한다. */
+async function loadMemberIndex() {
+  if (DB.memberLoaded) return DB.memberIdx;
+  if (!DB.memberLoading) {
+    DB.memberLoading = fetchJSON('./data/member_gs25.json')
+      .then(rows => {
+        DB.memberIdx = buildMemberIndex(Array.isArray(rows) ? rows : []);
+        DB.memberMatched = applyMemberMatch(DB.stores, DB.memberIdx);
+        DB.memberLoaded = true;
+        return DB.memberIdx;
+      })
+      .catch(() => { DB.memberIdx = null; delete DB.memberLoading; return null; });
+  }
+  return await DB.memberLoading;
+}
+/* 시도 원본 가맹점 파일을 불렀을 때의 교차 보정(색인 누락·표기 추가 대응) */
+function applySidoMemberFile(sido, list) {
+  if (!Array.isArray(list) || !list.length) return 0;
+  const rows = list.map(m => [m[0], m[1], m[2], m[3], m[4], m[5], sido]);
+  const idx = buildMemberIndex(rows);
+  const target = DB.stores.filter(s => s.sido === sido);
+  let hit = 0;
+  target.forEach(s => {
+    const rec = matchStoreMember(s, idx);
+    if (rec) { s.onnuri_member = true; s.member = rec; s.memberFrom = 'merchant-file'; hit++; }
+  });
+  if (hit) { DB.memberMatched = DB.stores.filter(s => s.onnuri_member).length; T3.dirty = true; }
+  return hit;
+}
+function memberChip(s) {
+  if (!s || s.kind === 'addr') return '';
+  if (!s.onnuri_member) return '<span class="chip o">미가맹</span>';
+  const m = s.member || {};
+  const pay = [m.paper ? '지류' : '', m.digital ? '디지털' : ''].filter(Boolean).join('·');
+  return `<span class="chip s" title="${esc([m.zone, m.year ? m.year + '년 등록' : '', pay].filter(Boolean).join(' · '))}">온누리 가맹</span>`;
 }
 
 /* #####################################################################
@@ -767,6 +879,10 @@ function evaluate(p, areaM2) {
 /* ---- 평가 캐시 · 우선순위 점수(내부 참고용, 법적 판정과 분리) ---- */
 const EVC = new Map();
 function ev(p, area) { const k = `${p.id}|${area}|${p.lat},${p.lng}`; if (!EVC.has(k)) EVC.set(k, evaluate(p, area)); return EVC.get(k); }
+/* 항목별 상한 — 상단 기준표(지자체 35 + 밀집도 25 + 기존 구역·가맹 15 + 후보 형성 15 + 신뢰도 10 = 100)와 1:1로 맞춘다.
+   계산식이 상한을 넘겨도 여기서 잘라 100점 만점을 넘지 않게 한다(이전에는 구역·가맹이 18점까지 들어가 103/100으로 표기됨). */
+const PRIORITY_MAX = { rule: 35, density: 25, zone: 15, form: 15, trust: 10 };
+const PRIORITY_TOTAL_MAX = Object.values(PRIORITY_MAX).reduce((a, b) => a + b, 0);
 function priority(e) {
   const P = { rule: 0, density: 0, zone: 0, form: 0, trust: 0 };
   const ratio = e.ratio || 0;
@@ -774,11 +890,13 @@ function priority(e) {
   P.density = Math.min((e.per || 0) / ((e.th || 30) * 1.5), 1) * 25;
   if (e.inside.length) P.zone = 4;
   else if (e.overlapping.length) P.zone = 6;
-  else P.zone = e.nearest ? (e.nearest.edge <= CONFIG.MEMBER_NEAR_M ? 18 : e.nearest.edge <= CONFIG.MEMBER_NEAR_M * 3 ? 12 : 3) : 3;
+  /* 기존 구역·가맹은 15점이 상한이므로 300m 이내 15점, 900m 이내 10점으로 배점(구 18/12점은 상한 초과 원인) */
+  else P.zone = e.nearest ? (e.nearest.edge <= CONFIG.MEMBER_NEAR_M ? 15 : e.nearest.edge <= CONFIG.MEMBER_NEAR_M * 3 ? 10 : 3) : 3;
   P.form = Math.max(0, Math.min(1, (ratio - .6) / .4)) * 15;
   P.trust = (e.rule ? 4 : 0) + (e.rule && daysSince(e.rule.updated) <= UI.STALE_DAYS ? 3 : 0) + (e.counts ? 3 : 0);
-  Object.keys(P).forEach(k => P[k] = Math.round(P[k] * 10) / 10);
-  return { ...P, total: Math.round(P.rule + P.density + P.zone + P.form + P.trust) };
+  Object.keys(P).forEach(k => P[k] = Math.round(Math.min(P[k], PRIORITY_MAX[k]) * 10) / 10);
+  const total = Math.round(P.rule + P.density + P.zone + P.form + P.trust);
+  return { ...P, total: Math.min(PRIORITY_TOTAL_MAX, total), max: PRIORITY_TOTAL_MAX };
 }
 const FIELD_ITEMS = ['구역 경계(도로·블록) 실측 확인', '소상공인 점포 실재·영업 여부 확인', '상인 조직(상인회) 구성 의사 확인', '기존 온누리 구역 경계 중첩 확인', '지자체 담당 부서 사전 상담'];
 const fieldState = id => { const c = LS.get('chk:' + id, []); const n = c.filter(Boolean).length; return n === 0 ? '필요' : n >= FIELD_ITEMS.length ? '완료' : '진행 중'; };
@@ -808,7 +926,7 @@ const KMap = {
     if (!this.inst[id]) { const el = document.getElementById(id); el.innerHTML = ''; this.inst[id] = new kakao.maps.Map(el, { center: new kakao.maps.LatLng(37.27, 127.03), level: 4 }); this.overlays[id] = []; }
     return this.inst[id];
   },
-  clear(id) { (this.overlays[id] || []).forEach(o => o.setMap(null)); this.overlays[id] = []; },
+  clear(id) { (this.overlays[id] || []).forEach(o => o.setMap(null)); this.overlays[id] = []; this.zoneLabels = this.zoneLabels || {}; this.zoneLabels[id] = []; },
   add(id, o) { o.setMap(this.map(id)); this.overlays[id].push(o); return o; },
   ll: p => new kakao.maps.LatLng(p.lat, p.lng),
   dot(id, p, color, size = 8, title = '') {
@@ -852,6 +970,38 @@ Object.assign(KMap, {
     lb.style.cssText = `padding:2px 8px;background:#fff;border:1px solid ${color};border-radius:6px;font:700 11px Pretendard,'Noto Sans KR',sans-serif;color:${color};white-space:nowrap;cursor:pointer`;
     lb.textContent = z.name; if (onClick) lb.onclick = onClick;
     this.add(id, new kakao.maps.CustomOverlay({ position: this.ll(z), content: lb, yAnchor: 2.4 }));
+    this.zoneLabels = this.zoneLabels || {};
+    (this.zoneLabels[id] = this.zoneLabels[id] || []).push({ el: lb, z, strong: !!strong });
+  },
+  /* 줌 레벨·화면상 거리에 따라 구역 이름표를 선별한다.
+     광역(레벨 8↑)에서는 이름표를 모두 숨기고, 중간 레벨에서는 화면 좌표가 겹치는 이름표를 뒤로 숨긴다. */
+  applyZoneLabels(id) {
+    const items = (this.zoneLabels && this.zoneLabels[id]) || [];
+    if (!items.length || !this.inst[id]) return null;
+    const m = this.inst[id];
+    const lvl = typeof m.getLevel === 'function' ? m.getLevel() : 0;
+    const proj = typeof m.getProjection === 'function' ? m.getProjection() : null;
+    const placed = [];
+    /* 선택 구역을 먼저 그리고(항상 표시), 나머지는 이름표 영역이 겹치면 숨긴다. */
+    const order = items.slice().sort((a, b) => (b.strong ? 1 : 0) - (a.strong ? 1 : 0));
+    order.forEach(it => {
+      let show = it.strong || lvl <= CONFIG.LABEL_MAX_LEVEL;
+      if (show && proj && !it.strong) {
+        let cp = null;
+        try { cp = proj.containerPointFromCoords(this.ll(it.z)); } catch { cp = null; }
+        if (cp) {
+          const w = it.w || (it.w = 16 + [...String(it.z.name || '')].reduce((a, c) => a + (c.charCodeAt(0) > 255 ? 12 : 7), 0));
+          const box = { x1: cp.x - w / 2, x2: cp.x + w / 2, y1: cp.y - 20, y2: cp.y - 4 };
+          const hit = placed.some(b => !(box.x2 < b.x1 || box.x1 > b.x2 || box.y2 < b.y1 || box.y1 > b.y2));
+          if (hit) show = false;
+          else placed.push(box);
+        }
+      }
+      if (it.el) it.el.style.display = show ? '' : 'none';
+    });
+    this._labelLevel = this._labelLevel || {};
+    this._labelLevel[id] = lvl;
+    return lvl;
   },
   clickDot(id, p, color, size, title, onClick) { const o = this.dot(id, p, color, size, title); const el = o.getContent(); if (onClick) { el.style.cursor = 'pointer'; el.onclick = onClick; } return o; },
   gs(id, p, active, onClick) { const el = document.createElement('div'); el.className = 'gs-mk' + (active ? ' on' : ''); el.textContent = 'GS'; el.title = p.name; if (onClick) el.onclick = onClick; return this.add(id, new kakao.maps.CustomOverlay({ position: this.ll(p), content: el, xAnchor: .5, yAnchor: .5, zIndex: 5 })); },
@@ -870,13 +1020,20 @@ function svgMap(el, { center, extent, layers }) {
   for (let m = -Math.ceil(w / 2 / s / step) * step; m <= w / 2 / s; m += step) { const x = w / 2 + m * s; g += `<line class="grid" x1="${x}" y1="0" x2="${x}" y2="${h}"/>`; }
   for (let m = -Math.ceil(h / 2 / s / step) * step; m <= h / 2 / s; m += step) { const y = h / 2 + m * s; g += `<line class="grid" x1="0" y1="${y}" x2="${w}" y2="${y}"/>`; }
   let body = '', top = '';
-  const lbl = (x, y, text, color) => { const tw = [...text].reduce((a, c) => a + (c.charCodeAt(0) > 255 ? 11 : 6.4), 0) + 14; return `<g transform="translate(${x},${y})" pointer-events="none"><rect x="${-tw / 2}" y="-10" width="${tw}" height="19" rx="5" fill="#fff" stroke="${color}"/><text text-anchor="middle" y="3.5" font-size="11" font-weight="700" fill="${color}">${esc(text)}</text></g>`; };
+  const placed = [];
+  const lbl = (x, y, text, color, force) => {
+    const tw = [...text].reduce((a, c) => a + (c.charCodeAt(0) > 255 ? 11 : 6.4), 0) + 14;
+    const box = { x1: x - tw / 2, y1: y - 10, x2: x + tw / 2, y2: y + 9 };
+    if (!force && placed.some(b => !(box.x2 < b.x1 || box.x1 > b.x2 || box.y2 < b.y1 || box.y1 > b.y2))) return '';
+    placed.push(box);
+    return `<g transform="translate(${x},${y})" pointer-events="none"><rect x="${-tw / 2}" y="-10" width="${tw}" height="19" rx="5" fill="#fff" stroke="${color}"/><text text-anchor="middle" y="3.5" font-size="11" font-weight="700" fill="${color}">${esc(text)}</text></g>`;
+  };
   for (const L of layers) {
     if (L.t === 'zone') {
       const z = L.z, c = L.color || '#7357C9', fo = L.strong ? .3 : .14, dash = z.candidate ? ' stroke-dasharray="6 4"' : '', sw = L.strong ? 3 : 1.5;
       if (z.polygon) body += `<polygon ${L.attr || ''} points="${z.polygon.map(([a, b]) => `${X({ lat: a, lng: b })},${Y({ lat: a, lng: b })}`).join(' ')}" fill="${c}" fill-opacity="${fo}" stroke="${c}" stroke-width="${sw}"${dash}><title>${esc(z.name)}</title></polygon>`;
       else body += `<circle ${L.attr || ''} cx="${X(z)}" cy="${Y(z)}" r="${Math.max(4, z.radius * s)}" fill="${c}" fill-opacity="${fo}" stroke="${c}" stroke-width="${sw}"${dash}><title>${esc(z.name)}</title></circle>`;
-      if (L.label !== false) top += lbl(X(z), Y(z) - Math.max(12, z.radius * s) - 8, z.name, c);
+      if (L.label !== false || L.strong) top += lbl(X(z), Y(z) - Math.max(12, z.radius * s) - 8, z.name, c, !!L.strong);
     } else if (L.t === 'ring') {
       body += `<circle cx="${X(L.p)}" cy="${Y(L.p)}" r="${L.r * s}" fill="rgba(23,36,56,.04)" stroke="#172438" stroke-width="1.6" stroke-dasharray="6 4" pointer-events="none"/>`;
       body += `<text x="${X(L.p) + L.r * s + 6}" y="${Y(L.p) + 4}" font-size="11" fill="#66758A">검토 r ${Math.round(L.r)}m</text>`;
@@ -890,7 +1047,7 @@ function svgMap(el, { center, extent, layers }) {
     } else if (L.t === 'pin') {
       const x = X(L.p), y = Y(L.p);
       top += `<g transform="translate(${x},${y})" pointer-events="none"><path d="M0 0 C-10 -13 -12 -17 -12 -23 a12 12 0 0 1 24 0 c0 6 -2 10 -12 23z" fill="#D43B3B" stroke="#fff" stroke-width="1.8"/><circle cy="-23" r="4.5" fill="#fff"/></g>`;
-      if (L.label) top += lbl(x, y - 46, L.label, '#172438');
+      if (L.label) top += lbl(x, y - 46, L.label, '#172438', true);
     }
   }
   const sb = niceStep(extent / 2.5), sbw = sb * s;
@@ -945,7 +1102,7 @@ const VMETA = {
   na:   { label:'검증 불가', icon:'info', head:'조례 기준 데이터 없음',         color:'var(--unknown)' },
 };
 const badge = (v, lg) => `<span class="badge ${v}${lg ? ' big' : ''}">${ic(VMETA[v].icon, lg ? 16 : 13)}${VMETA[v].label}</span>`;
-const stateBox = (kind, title, desc, actHtml = '') => `<div class="state ${kind === 'err' ? 'err' : ''}"><div class="ic">${ic(kind === 'err' ? 'warn' : kind === 'empty' ? 'search' : 'info', 20)}</div><b>${esc(title)}</b>${desc ? `<span>${esc(desc)}</span>` : ''}${actHtml}</div>`;
+const stateBox = (kind, title, desc, actHtml = '') => `<div class="state ${kind === 'err' ? 'err' : ''}"><div class="ic">${kind === 'loading' ? '<div class="spin" style="width:18px;height:18px;border-width:2px"></div>' : ic(kind === 'err' || kind === 'warn' ? 'warn' : kind === 'empty' ? 'search' : 'info', 20)}</div><b>${esc(title)}</b>${desc ? `<span>${esc(desc)}</span>` : ''}${actHtml}</div>`;
 
 function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 2200); }
 async function copyText(txt, msg = '복사했습니다') { try { await navigator.clipboard.writeText(txt); toast(msg); } catch { toast('클립보드 권한이 없어 복사하지 못했습니다'); } }
@@ -1011,6 +1168,7 @@ function t1Init() {
   $('#t1-shops').addEventListener('click', e => {
     const th = e.target.closest('[data-sort]'); if (th) { const k = th.dataset.sort; T1.sort = T1.sort.k === k ? { k, dir: -T1.sort.dir } : { k, dir: 1 }; renderShops(T1.ev); return; }
     const pg = e.target.closest('[data-pg]'); if (pg && !pg.disabled) { T1.page = +pg.dataset.pg; renderShops(T1.ev); return; }
+    if (e.target.closest('#shops-retry')) { nearbyReset(T1.ev.p.sido); t1Run(); return; }
     if (e.target.closest('#live-go')) { t1Live(T1.ev); return; }
     if (e.target.closest('#shops-csv')) { const rows = t1ShopRows(T1.ev); downloadCSV(`후보상가_${T1.ev.p.name}.csv`, toCSV([['상가명', r => r.s.name], ['업종', r => r.s.category], ['위치', r => `${r.dir} ${Math.round(r.d)}m`], ['포함여부', r => r.inc], ['소상공인확인', r => r.chk], ['온누리', r => r.s.onnuri_member ? '가맹' : '미가맹'], ['결제방식', r => r.s.pay.join('|')], ['위도', r => r.s.lat], ['경도', r => r.s.lng]], rows)); return; }
     const tr = e.target.closest('tr[data-sid]'); if (tr) t1Highlight(tr.dataset.sid, false);
@@ -1184,6 +1342,17 @@ function ruleStdHTML(e) {
   return `<b class="num">${base}㎡</b>당 소상공인 <b>${e.th}개</b> 이상 <span class="faint">(조례상 단일 기준)</span>`;
 }
 
+/* 온누리 가맹 여부 행(B구역) — 점포 상호와 가맹점 DB 표기가 달라도 같은 점포로 묶어 보여준다 */
+function memberInfoHTML(s) {
+  const m = s.member;
+  if (s.onnuri_member && m) {
+    const pay = [m.paper ? '지류' : '', m.digital ? '디지털' : ''].filter(Boolean).join('·') || '결제수단 미기재';
+    return `<span class="chip s">가맹</span> <b>${esc(m.zone || '상권명 미기재')}</b>${m.year ? ` · ${esc(m.year)}년 등록` : ''} · ${esc(pay)}`;
+  }
+  if (!DB.memberLoaded) return '<span class="chip o">확인 중</span> <span class="faint">가맹점 색인을 불러오는 중입니다</span>';
+  return '<span class="chip o">미가맹</span> <span class="faint">온누리상품권 가맹점 DB(2026-07-31)에 같은 상호가 없습니다. 표기 차이가 있을 수 있으니 탭 2에서 한 번 더 확인하세요.</span>';
+}
+
 /* 조례 완화 조건 배지 */
 function ruleBadges(r) {
   if (!r) return '<span class="chip w">조례 미확인</span>';
@@ -1213,6 +1382,7 @@ function renderVerdict(e) {
       <div class="vrow"><span class="k">검토 구역</span><span class="v"><b class="num">${fmt(e.area)}㎡</b> <span class="faint">(원형 환산 반경 ${Math.round(e.r)}m${e.counts && e.counts.est ? ' · 보간 추정' : ' · 실측'})</span></span></div>
       <div class="vrow"><span class="k">충족률</span><span class="v" style="display:flex;align-items:center;gap:12px"><span class="prog" style="flex:1"><i style="width:${w}%;background:${m.color}"></i><span class="tick" style="left:${100 / 1.5}%" title="기준 100%"></span></span><b class="num" style="min-width:44px;text-align:right;color:${m.color}">${pct != null ? pct + '%' : '—'}</b></span></div>
       <div class="vrow"><span class="k">기존 구역 거리</span><span class="v">${e.nearest ? `<b>${esc(e.nearest.z.name)}</b> 중심 ${fmtD(e.nearest.d)} · 경계 ${fmtD(e.nearest.edge)} <span class="chip ${rel[1]}">${rel[0]}</span>` : '—'}</span></div>
+      <div class="vrow"><span class="k">온누리 가맹</span><span class="v">${memberInfoHTML(e.p)}</span></div>
       <div class="vrow" style="border-bottom:0"><span class="k">중복 여부</span><span class="v">${dup}</span></div>
     </div>
     <div class="trio num">
@@ -1236,7 +1406,7 @@ function t1ShopRows(e) {
   const R = e.r * UI.EDGE, out = [];
   nearbyList(e.p.id).forEach((x, i) => {
     const d = x[0]; if (d > R) return;
-    out.push({ s: { id: e.p.id + '-' + i, name: x[1], category: x[2], is_small_biz: true, onnuri_member: false, pay: [] }, d, inc: d <= e.r ? '포함' : '경계', chk: '미확인' });
+    out.push({ s: { id: e.p.id + '-' + i, name: x[1], category: x[2], is_small_biz: true, onnuri_member: !!matchShopMember(x[1], e.p.sido), pay: [] }, d, inc: d <= e.r ? '포함' : '경계', chk: '미확인' });
   });
   return out;
 }
@@ -1254,8 +1424,24 @@ function renderShops(e) {
   const slice = rows.slice(T1.page * size, (T1.page + 1) * size);
   const st = T1.sort;
   const covNote = !e.p.cov ? `<div class="foot" style="padding:8px 16px 0;color:var(--danger)">${esc(e.p.sido)}는 상가(상권)정보 CSV 수집 범위 밖입니다. 아래 실시간 조회로 확인하세요.</div>` : '';
+  /* 리스트가 비어 보이는 이유를 구분한다: (a) 아직 로딩 중 (b) 받기 실패 (c) 집계와 불일치 (d) 진짜 0건 */
+  const nst = e.p.cov ? nearbyState(e.p.sido) : 'nocov';
+  const loading = nst === 'loading' || (nst === 'idle' && e.p.cov);
+  const agg = e.nSmall || 0;
+  let emptyHtml = '';
+  if (loading) {
+    emptyHtml = stateBox('loading', '반경 내 상가 리스트를 불러오는 중입니다', `${esc(e.p.sido)} 상가(상권)정보 파일을 내려받는 중입니다(수 MB). 잠시 후 자동으로 채워집니다.`);
+  } else if (nst === 'error') {
+    emptyHtml = stateBox('err', '반경 내 상가 리스트를 불러오지 못했습니다', `${esc(e.p.sido)} 상가 파일을 내려받지 못했습니다. 위 B구역의 상가 수(${fmt(agg)}개)는 사전 집계값이라 그대로 유효합니다.`, '<button class="btn sm" id="shops-retry">다시 불러오기</button>');
+  } else if (!e.p.cov) {
+    emptyHtml = stateBox('empty', '반경 내 상가 데이터가 없습니다', `${esc(e.p.sido)}는 상가(상권)정보 CSV 수집 범위 밖입니다. 아래 실시간 카카오 조회로 확인하세요.`);
+  } else if (agg > 0) {
+    emptyHtml = stateBox('warn', '리스트에는 0건, 사전 집계는 ' + fmt(agg) + '개입니다', 'B구역의 상가 수는 상가(상권)정보 반경 집계값이고, 이 리스트는 점포별 상세 파일에 있는 업소만 표시합니다. 두 값의 차이는 집계 기준(호실 단위·업종 필터)에서 생깁니다. 현장 확인 시 사전 집계값을 기준으로 보고, 상세 업소는 실시간 카카오 조회로 보완하세요.');
+  } else {
+    emptyHtml = stateBox('empty', '반경 내 상가 데이터가 없습니다', '사전 집계(반경 내 소상공인)도 0개입니다. 이 점포 주변에는 상가업소가 거의 없습니다.');
+  }
   $('#t1-shops').innerHTML = `
-    <div class="card-h"><span class="step">C</span><h3>반경 내 상가 리스트</h3><span class="sub">(경계 +15% 포함 ${total}개 · 실측)</span>
+    <div class="card-h"><span class="step">C</span><h3>반경 내 상가 리스트</h3><span class="sub">(${loading ? '불러오는 중' : '경계 +15% 포함 ' + total + '개 · 실측'})</span>
       <div class="right">
         <select class="select" id="shops-filter" style="width:130px;height:28px" aria-label="상가 필터">
           <option value="">전체</option><option value="inc" ${f === 'inc' ? 'selected' : ''}>검토 구역 포함</option><option value="edge" ${f === 'edge' ? 'selected' : ''}>경계(+15%)</option></select>
@@ -1266,7 +1452,7 @@ function renderShops(e) {
         <td class="faint">${T1.page * size + i + 1}</td><td><b>${esc(r.s.name)}</b></td><td>${esc(r.s.category)}</td>
         <td>${Math.round(r.d)}m</td>
         <td>${r.inc === '포함' ? '<span class="chip a">포함</span>' : '<span class="chip o">경계</span>'}</td></tr>`).join('')}
-      </tbody></table>` : stateBox('empty', '반경 내 상가 데이터가 없습니다', !e.p.cov ? '해당 시도 상가정보가 수집되지 않았습니다' : '이 점포 주변에는 상가업소가 거의 없습니다')}</div>
+      </tbody></table>` : emptyHtml}</div>
     <div class="pager">${pagerHTML(T1.page, pages, rows.length, size)}</div>
     ${covNote}
     <div class="foot" style="padding:8px 16px 12px">출처: 소상공인시장진흥공단 상가(상권)정보(2026-09-30) · 반경 ${Math.round(e.r * UI.EDGE)}m 내 상가업소. 개별 점포의 온누리 가맹 여부는 탭 2에서 확인하세요.</div>
@@ -1433,7 +1619,10 @@ async function t2LoadMerch() {
   T2.mstate = 'loading'; t2Render();
   if (!sido) { T2.merch = []; T2.mstate = 'need'; return t2Render(); }
   const list = await loadMerchants(sido);
-  T2.merch = list; T2.mstate = 'ok'; T2.page = 0; t2Render();
+  T2.merch = list; T2.mstate = 'ok'; T2.page = 0;
+  /* 이 시도의 가맹점 원본으로 점포 DB를 교차 보정(색인 누락·새 표기 대응) */
+  if (applySidoMemberFile(sido, list) && T1.sel) t1Run();
+  t2Render();
 }
 
 function t2Filters() { const v = s => ($(s) ? $(s).value : ''); return { sido: v('#f-sido'), sgg: v('#f-sgg'), zone: v('#f-zone').trim(), mname: v('#f-mname').trim(), cat: v('#f-cat'), status: v('#f-status'), member: v('#f-member'), fresh: v('#f-fresh') }; }
@@ -1512,6 +1701,14 @@ function t2FocusFromMap(kind, id) {
   T2._jump = true; t2Render();
 }
 
+/* 지도2 이름표 재배치 — 첫 렌더와 줌 변경 이벤트가 같은 함수를 쓴다 */
+function t2LabelStep() {
+  const id = 'map2';
+  const lvl = KMap.applyZoneLabels(id);
+  const cap = $('#map2-caption');
+  if (lvl != null && cap && T2.capBase) cap.textContent = T2.capBase + (lvl > CONFIG.LABEL_MAX_LEVEL && !T2.focus ? ' · 확대하면 구역 이름 표시' : '');
+}
+
 function t2Map(zones) {
   if (!zones) ({ zones } = t2Data());
   const f = T2.focus;
@@ -1528,7 +1725,8 @@ function t2Map(zones) {
   } else { center = { lat: 36.4, lng: 127.8 }; extent = 260000; }
   const inView = p => dist(center, p) < extent * 1.6;
   const stores = extent > 8000 ? [] : DB.stores.filter(inView).slice(0, 400);
-  $('#map2-caption').textContent = fo ? fo.name : `구역 ${zones.length} · GS25 ${stores.length}`;
+  const capBase = fo ? fo.name : `구역 ${zones.length} · GS25 ${stores.length}`;
+  $('#map2-caption').textContent = capBase;
   mapNote('map2');
   const zc = r => r.status === '지정 완료' ? '#7357C9' : '#C98A1B';
   const visZones = zones.filter(r => inView(r.z)).slice(0, extent > 8000 ? 80 : 400);
@@ -1538,11 +1736,16 @@ function t2Map(zones) {
     stores.forEach(s => KMap.gs(id, s, false, () => { switchView('check'); t1Select({ kind: 'store', ...s }); }));
     m.setCenter(KMap.ll(center));
     m.setLevel(extent < 300 ? 3 : extent < 800 ? 5 : extent < 3000 ? 7 : extent < 20000 ? 9 : 12);
+    /* 줌을 바꿀 때마다 이름표를 다시 선별한다(광역에서 글씨가 겹치던 문제). 리스너는 지도당 1개만 등록한다. */
+    T2.capBase = capBase;
+    t2LabelStep();
+    if (!m.__labelHook) { m.__labelHook = true; kakao.maps.event.addListener(m, 'zoom_changed', t2LabelStep); }
   } else {
     svgMap($('#map2'), { center, extent, layers: [
-      ...visZones.map(r => ({ t: 'zone', z: r.z, color: zc(r), strong: f && f.id === r.id, label: extent < 20000, attr: `data-zone="${esc(r.id)}"` })),
+      ...visZones.map(r => ({ t: 'zone', z: r.z, color: zc(r), strong: f && f.id === r.id, label: extent <= CONFIG.LABEL_MAX_EXTENT, attr: `data-zone="${esc(r.id)}"` })),
       ...stores.slice(0, 400).map(s => ({ t: 'gs', p: s, attr: `data-gs="${esc(s.id)}"` })),
     ] });
+    if (extent > CONFIG.LABEL_MAX_EXTENT && !fo) $('#map2-caption').textContent = capBase + ' · 확대하면 구역 이름 표시';
     $('#map2 svg').onclick = e => {
       const g = e.target.closest('[data-gs]'); if (g) { const s = DB.stores.find(x => x.id === g.dataset.gs); switchView('check'); t1Select({ kind: 'store', ...s }); return; }
       const z = e.target.closest('[data-zone]'); if (z) t2FocusFromMap('zone', z.dataset.zone);
@@ -1588,6 +1791,7 @@ function t3Init() {
   $('#d-reset').onclick = () => { ['#d-sido', '#d-sgg', '#d-met', '#d-field'].forEach(s => $(s).value = ''); $('#d-member').value = 'N'; $('#d-verdict').value = 'cond'; $('#d-shops').value = 0; $('#d-score').value = 0; $('#d-area').value = CONFIG.DEFAULT_AREA; T3.page = 0; T3.sort = { k: 'score', dir: -1 }; t3Render(); };
   $('#d-csv').onclick = () => downloadCSV('잠재점포_우선순위.csv', toCSV([
     ['순위', r => r.rank], ['점포코드', r => r.e.p.id], ['점포명', r => r.e.p.name], ['지역', r => `${r.e.p.sido} ${r.e.p.sigungu}`],
+    ['온누리가맹', r => r.e.p.onnuri_member ? '가맹' : '미가맹'], ['가맹상권', r => r.e.p.member ? r.e.p.member.zone : ''],
     ['법적판정', r => VMETA[r.e.v].label], ['충족률%', r => r.e.ratio != null ? Math.round(r.e.ratio * 100) : ''], ['소상공인수', r => r.e.nSmall], ['필요수', r => r.e.required ?? ''],
     ['기존구역관계', r => r.rel[0]], ['최근접구역', r => r.rel[2]], ['우선순위점수', r => r.pr.total],
     ['지자체기준35', r => r.pr.rule], ['밀집도25', r => r.pr.density], ['기존구역가맹15', r => r.pr.zone], ['후보형성15', r => r.pr.form], ['데이터신뢰10', r => r.pr.trust],
@@ -1641,13 +1845,13 @@ function t3Render() {
     ${slice.map(r => { const e = r.e, pct = e.ratio != null ? Math.round(e.ratio * 100) : null, col = VMETA[e.v].color;
       return `<tr>
         <td><span class="crown">${r.rank <= 3 && T3.sort.k === 'score' && T3.sort.dir < 0 ? `<span style="color:${CROWN[r.rank - 1]}">${ic('crown', 16)}</span>` : '<span style="width:16px;display:inline-block"></span>'}${r.rank}</span></td>
-        <td><div class="cell2"><b>${esc(e.p.name)}</b><small>${esc(e.p.id)} · ${esc(e.p.address)}</small></div></td>
+        <td><div class="cell2"><b>${esc(e.p.name)}</b> ${memberChip(e.p)}<small>${esc(e.p.id)} · ${esc(e.p.address)}</small></div></td>
         <td>${esc(e.p.sido)} ${esc(e.p.sigungu)}</td>
         <td class="sep">${badge(e.v)}</td>
         <td>${pct != null ? `<b style="color:${col}">${pct}%</b><span class="minibar"><i style="width:${Math.min(e.ratio, 1.5) / 1.5 * 100}%;background:${col}"></i></span>` : '<span class="faint">—</span>'}</td>
         <td class="r"><b>${e.nSmall}</b> <span class="faint">/ 필요 ${e.required ?? '-'}</span></td>
         <td><span class="chip ${r.rel[1]}">${r.rel[0]}</span> <span class="muted">${esc(r.rel[2])}${e.nearest && !e.inside.length ? ' · ' + fmtD(e.nearest.edge) : ''}</span></td>
-        <td class="sep"><div class="sbar" title="${SEG.map(([k, , l]) => `${l} ${r.pr[k]}`).join(' / ')}"><span class="track">${SEG.map(([k, c]) => `<i style="width:${r.pr[k]}%;background:${c}"></i>`).join('')}</span><b>${r.pr.total}<small>/100</small></b></div></td>
+        <td class="sep"><div class="sbar" title="${SEG.map(([k, , l]) => `${l} ${r.pr[k]}`).join(' / ')}"><span class="track">${SEG.map(([k, c]) => `<i style="width:${r.pr[k]}%;background:${c}"></i>`).join('')}</span><b>${r.pr.total}<small>/${r.pr.max || 100}</small></b></div></td>
         <td>${fieldChip(r.field)}</td>
         <td class="sep"><button class="btn sm primary" data-open="${esc(e.p.id)}">상세 분석 ${ic('chev', 12)}</button></td></tr>`; }).join('')}
     </tbody></table>` : stateBox('empty', '조건에 맞는 후보가 없습니다', '최소 적격 가능성이나 점수 조건을 완화해 보세요', '<button class="btn sm" onclick="document.getElementById(\'d-reset\').click()">필터 초기화</button>');
@@ -1694,11 +1898,12 @@ function updateHeader() {
   const m = DB.meta || {};
   const src = (m.sources || []).find(x => x.name === '상가(상권)정보') || {};
   $('#h-sync').innerHTML = '<i class="dot ok"></i>실데이터 연동';
-  $('#h-sync').title = `점포 ${fmt(DB.stores.length)} · 상가 반경계산 ${fmt(m.stores_with_shop_data || 0)}개 점포 · 구역 ${fmt(DB.zones.length)} · 조례 ${fmt(DB.rules.length)} · 가맹점 ${fmt(m.merchants || 0)}`;
+  $('#h-sync').title = `점포 ${fmt(DB.stores.length)} · 상가 반경계산 ${fmt(m.stores_with_shop_data || 0)}개 점포 · 구역 ${fmt(DB.zones.length)} · 조례 ${fmt(DB.rules.length)} · 가맹점 ${fmt(m.merchants || 0)} · 가맹 매칭 ${fmt(DB.memberMatched || 0)}개 점포`;
   $('#h-date').textContent = `상가정보 ${src.asof || ''} 기준 · 로드 ${fmtDT(DB.loadedAt)}`;
 }
 function rebuild() {
   buildDB(RAW); EVC.clear(); t2Build();
+  if (DB.memberIdx) DB.memberMatched = applyMemberMatch(DB.stores, DB.memberIdx);
   updateHeader(); updateNavKPI();
   if (T1.sel && T1.sel.kind === 'store') { const s = DB.stores.find(x => x.id === T1.sel.id); T1.sel = s ? { kind: 'store', ...s } : null; }
   T1.sel ? t1Run() : t1RenderEmpty();
@@ -1717,6 +1922,8 @@ async function start() {
     if (n.some(x => !x)) return bootError(`필수 데이터셋이 비어 있습니다 (city_rules ${n[0]} · onnuri_zones ${n[1]} · stores ${n[2]}). ${CONFIG.DATA_SOURCE === 'remote' ? 'DATA_URLS 경로를 확인하세요.' : ''}`);
     rebuild();
     $('#boot').remove();
+    /* 온누리 가맹 색인을 먼저 반영해야 탭 3의 '미가맹' 필터와 탭 1의 가맹 표시가 맞게 나온다 */
+    await loadMemberIndex();
     const first = DB.stores[0]; if (first && !T1.sel) t1Select({ kind: 'store', ...first });
     switchView(location.hash.slice(1) || 'check');
   } catch (err) { bootError(err.message || String(err)); }
